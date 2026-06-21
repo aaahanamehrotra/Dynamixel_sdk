@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+ik_step_physical.py — 10-DOF Humanoid Step Controller for Real Hardware (AX-12A)
+"""
+
+import math
+import time
+import threading
+from dynamixel_sdk import *
+
+# =============================================================================
+# 1. HARDWARE CONFIGURATION & TRANSLATION
+# =============================================================================
+TICKS_PER_RADIAN = 1024 / (300.0 * math.pi / 180.0)
+
+ADDR_AX_GOAL_POSITION = 30
+LEN_AX_GOAL_POSITION  = 2
+PROTOCOL_VERSION      = 1.0
+BAUDRATE              = 1000000  
+DEVICENAME            = 'COM10' # Change to 'COM3' etc. if on Windows
+
+ROBOT_CONFIG = {
+    # --- RIGHT LEG (Odds) ---
+    9:  {"offset": 510, "dir": 1},   # Hip Roll R   (- = right)
+    11: {"offset": 517, "dir": -1},  # Hip Pitch R  (- = leg up)
+    13: {"offset": 514, "dir": -1},  # Knee R       (- = bends backward)
+    15: {"offset": 509, "dir": 1},   # Ankle Pitch R(+ = lean forward)
+    17: {"offset": 499, "dir": 1},   # Ankle Roll R (- = anticlockwise)
+    
+    # --- LEFT LEG (Evens) ---
+    10: {"offset": 401, "dir": 1},   # Hip Roll L   (- = right) 
+    12: {"offset": 496, "dir": -1},  # Hip Pitch L  (- = leg up)
+    14: {"offset": 500, "dir": 1},   # Knee L       (+ = bends backward)
+    16: {"offset": 514, "dir": -1},  # Ankle Pitch L(- = lean forward)
+    18: {"offset": 523, "dir": 1}    # Ankle Roll L (- = anticlockwise)
+}
+
+STATIC_HOLDS = {
+    7: 972,  # Arm/Torso Hold
+    8: 33    # Arm/Torso Hold
+}
+
+def rad_to_tick(motor_id, radian_cmd):
+    """Translates IK radians to AX-12A ticks."""
+    config = ROBOT_CONFIG[motor_id]
+    tick_delta = radian_cmd * TICKS_PER_RADIAN * config["dir"]
+    target_tick = int(config["offset"] + tick_delta)
+    return max(0, min(1023, target_tick))
+
+# =============================================================================
+# 2. LEG LENGTHS & TARGETS
+# =============================================================================
+L1 = 0.11
+L2 = 0.116
+
+target_h_left = 0.23
+target_h_right = 0.23
+target_shift_left = 0.0
+target_shift_right = 0.0
+target_x_left = 0.0
+target_x_right = 0.0
+
+# =============================================================================
+# 3. SYSTEMATIC 6-STAGE GAIT STATE MACHINE
+# =============================================================================
+def set_targets(h_l, h_r, shift_l, shift_r, x_l, x_r, delay):
+    global target_h_left, target_h_right, target_shift_left, target_shift_right, target_x_left, target_x_right
+    target_h_left = h_l
+    target_h_right = h_r
+    target_shift_left = shift_l
+    target_shift_right = shift_r
+    target_x_left = x_l
+    target_x_right = x_r
+    time.sleep(delay)
+
+def swing_trajectory_right(duration):
+    steps = 50
+    dt = duration / steps
+    for i in range(steps + 1):
+        t = i / float(steps)
+        
+        # 1. Forward Progression
+        x_r = 0.00 + t * 0.12
+        
+        # 2. Sagittal Forward Lean
+        x_l = 0.00 - t * 0.03
+        
+        # 3. Foot Height Arc
+        x_ankle = -3.0 + 12.0 * t
+        raw_ankle = ((x_ankle - 9.0) ** 2) * (x_ankle + 3.0)
+        h_bump = -0.00015625 * raw_ankle
+        h_linear = 0.15 + t * (0.185 - 0.15)
+        h_r = h_linear - 0.05*math.sin(math.pi * t)
+        
+        # 4. Lateral Stance
+        com_lateral_sway = 0.03 * math.sin(math.pi * t)
+        shift_l = 0.30  
+        shift_r = (0.45 - t* 0.05) + com_lateral_sway
+        
+        # 5. COM Frontal Plane Trajectory
+        x_com = 2.0 + 2.0 * t
+        com_bump = 0.015625 * ((x_com - 4.0) ** 2) * (x_com - 2.0)
+        h_l = 0.22 + 0.5*com_bump
+        
+        set_targets(h_l, h_r, shift_l, shift_r, x_l, x_r, dt)
+
+def swing_trajectory_left(duration):
+    steps = 50
+    dt = duration / steps
+    for i in range(steps + 1):
+        t = i / float(steps)
+        
+        # 1. Forward Progression
+        x_l = -0.035 + t * 0.24
+        
+        # 2. Sagittal Forward Lean
+        x_r = -0.10 - t * 0.03
+        
+        # 3. Foot Height Arc
+        x_ankle = -3.0 + 12.0 * t
+        raw_ankle = ((x_ankle - 9.0) ** 2) * (x_ankle + 3.0)
+        h_bump = -0.00015625 * raw_ankle
+        h_linear = 0.14 + t * (0.19 - 0.14)
+        h_l = h_linear + h_bump
+        
+        # 4. Lateral Stance
+        com_lateral_sway = 0.03 * math.sin(math.pi * t)
+        shift_r = -0.30  
+        shift_l = (-0.40 + t* 0.02) + com_lateral_sway
+        
+        # 5. COM Frontal Plane Trajectory
+        x_com = 2.0 + 2.0 * t
+        com_bump = 0.015625 * ((x_com - 4.0) ** 2) * (x_com - 2.0)
+        h_r = 0.22 + com_bump
+        
+        set_targets(h_l, h_r, shift_l, shift_r, x_l, x_r, dt)
+
+def walk_sequence():
+    print("Resetting to standing pose...")
+    set_targets(0.23, 0.23, 0.0, 0.0, 0.0, 0.0, 3.0)
+    
+    print("\n--- Starting Forward Step Sequence ---")
+    
+    print("Stage 1: Pre-Crouch (Double Support)...")
+    set_targets(0.22, 0.22, 0.0, 0.0, 0.0, 0.0, 3.0)
+    
+    print("Stage 2: Left Lateral Shift (Reduced leftward mass)...")
+    set_targets(0.22, 0.22, 0.30, 0.30, 0.00, 0.00, 3) 
+    
+    print("Stage 3: Lifting Right Leg (Pre-emptive Forward Swing)...")
+    set_targets(0.22, 0.15, 0.30, 0.45, 0.00, 0.00, 3)
+
+    print("Stage 4: Continuous Sine-Wave Arc Trajectory...")
+    swing_trajectory_right(2.55)
+    
+    print("Stage 5: Wide-Stance Touchdown (Safe Landing)...")
+    set_targets(0.21, 0.185, 0.10, 0.05, -0.04, 0.115, 6.0)
+
+    # print("Stage 6: Right Lateral Shift (Reduced leftward mass)...")
+    # set_targets(0.22, 0.185, -0.20, -0.20, -0.035, 0.115, 3)
+
+    # print("Stage7 : left swing")
+    # swing_trajectory_left(5.1)
+
+    print("Resetting to standing pose...")
+    set_targets(0.23, 0.23, 0.0, 0.0, 0.0, 0.0, 3.0)
+    
+    print("--- Step Complete! Biped Stable. ---\n")
+
+def state_machine_thread():
+    time.sleep(2.5)
+    while True:
+        input("\n[PRESS ENTER] to execute a Static Step Forward...")
+        walk_sequence()
+
+# =============================================================================
+# 4. FLAWLESS 3-DOF GEOMETRIC IK
+# =============================================================================
+def compute_human_ik(height, x_offset):
+    y = height
+    x = x_offset
+    d = math.sqrt(x*x + y*y)
+    
+    max_len = L1 + L2 - 0.00001
+    d = min(d, max_len)
+
+    cos_knee = (d*d - L1*L1 - L2*L2) / (2 * L1 * L2)
+    cos_knee = max(min(cos_knee, 1.0), -1.0)
+    knee_raw = math.acos(cos_knee)
+
+    knee_geom = -knee_raw
+    hip_geom = math.atan2(x, y) + math.atan2(L2 * math.sin(knee_raw), L1 + L2 * math.cos(knee_raw))
+    ankle_geom = -(hip_geom + knee_geom)
+
+    return hip_geom, knee_geom, ankle_geom
+
+# =============================================================================
+# 5. MAIN CONTROL LOOP (GroupSyncWrite)
+# =============================================================================
+def main():
+    global target_h_left, target_h_right, target_shift_left, target_shift_right, target_x_left, target_x_right
+
+    # Initialize Dynamixel Port and Packet Handlers
+    portHandler = PortHandler(DEVICENAME)
+    packetHandler = PacketHandler(PROTOCOL_VERSION)
+    groupSyncWrite = GroupSyncWrite(portHandler, packetHandler, ADDR_AX_GOAL_POSITION, LEN_AX_GOAL_POSITION)
+
+    if not portHandler.openPort():
+        print(f"Failed to open port {DEVICENAME}. Check connection and permissions.")
+        quit()
+    if not portHandler.setBaudRate(BAUDRATE):
+        print(f"Failed to change the baudrate to {BAUDRATE}")
+        quit()
+
+    # Lock the arms to prevent swinging
+    print("Locking upper body joints...")
+    for motor_id, tick in STATIC_HOLDS.items():
+        packetHandler.write2ByteTxRx(portHandler, motor_id, ADDR_AX_GOAL_POSITION, tick)
+
+    # Start the state machine
+    threading.Thread(target=state_machine_thread, daemon=True).start()
+
+    current_h_left = 0.23
+    current_h_right = 0.23
+    current_shift_left = 0.0
+    current_shift_right = 0.0
+    current_x_left = 0.0
+    current_x_right = 0.0
+    
+    print("10-DOF Humanoid Step Controller Running via Dynamixel SDK!")
+    
+    # Target frequency: 100Hz
+    loop_time = 0.01 
+
+    while True:
+        start_time = time.perf_counter()
+
+        alpha = 0.025
+        current_h_left += (target_h_left - current_h_left) * alpha
+        current_h_right += (target_h_right - current_h_right) * alpha
+        current_shift_left += (target_shift_left - current_shift_left) * alpha
+        current_shift_right += (target_shift_right - current_shift_right) * alpha
+        current_x_left += (target_x_left - current_x_left) * alpha
+        current_x_right += (target_x_right - current_x_right) * alpha
+
+        lh_hip, lh_knee, lh_ankle = compute_human_ik(current_h_left, current_x_left)
+        rh_hip, rh_knee, rh_ankle = compute_human_ik(current_h_right, current_x_right)
+
+        # APPLY URDF JOINT SIGNS from IK
+        rh = rh_hip
+        rk = -rh_knee
+        ra = rh_ankle
+        
+        lh = -lh_hip
+        lk = -lh_knee
+        la = lh_ankle
+
+        # ROLL CALCULATIONS (Parallelogram Fix)
+        HIP_ROLL_GAIN = 1.0
+        ANKLE_ROLL_GAIN = -1.0
+        left_roll = -HIP_ROLL_GAIN * current_shift_left
+        right_roll = -HIP_ROLL_GAIN * current_shift_right
+        left_ankle_roll = ANKLE_ROLL_GAIN * current_shift_left
+        right_ankle_roll = -0.3 * current_shift_right
+
+        # Map to specific hardware IDs
+        target_radians = {
+            9:  right_roll,        # Right Hip Roll
+            11: rh,                # Right Hip Pitch
+            13: rk,                # Right Knee
+            15: ra,                # Right Ankle Pitch
+            17: right_ankle_roll,  # Right Ankle Roll
+            
+            10: left_roll,         # Left Hip Roll
+            12: lh,                # Left Hip Pitch
+            14: lk,                # Left Knee
+            16: la,                # Left Ankle Pitch
+            18: left_ankle_roll    # Left Ankle Roll
+        }
+
+        # Clear the syncwrite payload
+        groupSyncWrite.clearParam()
+
+        # Populate the bulk packet with translated ticks
+        for motor_id, rad_angle in target_radians.items():
+            tick = rad_to_tick(motor_id, rad_angle)
+            param_goal_position = [DXL_LOBYTE(tick), DXL_HIBYTE(tick)]
+            groupSyncWrite.addParam(motor_id, param_goal_position)
+
+        # Blast all commands to the servos simultaneously
+        dxl_comm_result = groupSyncWrite.txPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            print(f"SyncWrite Error: {packetHandler.getTxRxResult(dxl_comm_result)}")
+
+        # Strict loop timing maintenance
+        elapsed = time.perf_counter() - start_time
+        if elapsed < loop_time:
+            time.sleep(loop_time - elapsed)
+
+if __name__ == "__main__":
+    main()
